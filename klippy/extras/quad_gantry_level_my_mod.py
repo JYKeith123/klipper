@@ -10,12 +10,14 @@
 # 수정당시 revision - 72161d04053e168baf025957ec75008d0fd4f60f
 
 import logging
-import probe, z_tilt
+import probe, z_tilt, bed_mesh
 import traceback
 import json
 from decimal import Decimal
 import math
 import os
+import collections
+
 
 def list_to_decimal(v):
     return [Decimal(str(p)) for p in v]
@@ -52,7 +54,9 @@ class QuadGantryLevelMyMod:
         if len(self.probe_helper.probe_points) != 4:
             raise config.error(
                 "Need exactly 4 probe points for quad_gantry_level")
-        self.load_default_adjust()
+        self.default_adjust = [Decimal(0), Decimal(0), Decimal(0), Decimal(0)]
+        self.z_mesh_matrix = None
+        self.load_custom_data()
         gantry_corners = config.get('gantry_corners').split('\n')
         try:
             gantry_corners = [line.split(',', 1)
@@ -76,6 +80,81 @@ class QuadGantryLevelMyMod:
         self.gcode.register_command(
             'QUAD_GANTRY_ADJUST', self.cmd_QUAD_GANTRY_ADJUST,
             desc=self.cmd_QUAD_GANTRY_ADJUST_help)
+        self.gcode.register_command(
+            'QUAD_BED_MESH_ADJUST', self.cmd_QUAD_BED_MESH_ADJUST,
+            desc=self.cmd_cmd_QUAD_BED_MESH_ADJUST_help)
+        self.gcode.register_command(
+            'QUAD_BED_MESH_CLEAR', self.cmd_QUAD_BED_MESH_CLEAR,
+            desc=self.cmd_QUAD_BED_MESH_CLEAR_help)
+
+        self.toolhead = None
+        self.z_mesh = None
+        self.use_additional_z_mesh = config.getboolean("use_additional_z_mesh", False)
+        if self.use_additional_z_mesh:
+            self.mesh_params = collections.OrderedDict()
+            self.mesh_params['algo'] = 'bicubic'
+            self.mesh_params['tension'] = config.getfloat(
+                'bicubic_tension', .2, minval=0., maxval=2.)
+            self.points = self._generate_points(config)
+            self.fade_start = config.getfloat('fade_start', 1.)
+            self.fade_end = config.getfloat('fade_end', 0.)
+            self.fade_dist = self.fade_end - self.fade_start
+            if self.fade_dist <= 0.:
+                self.fade_start = self.fade_end = self.FADE_DISABLE
+
+            self.log_fade_complete = False
+            self.base_fade_target = config.getfloat('fade_target', None)
+            self.fade_target = 0.
+            self.splitter = bed_mesh.MoveSplitter(config, self.gcode)
+            self.gcode.set_move_transform(self)
+            self.apply_mesh()
+
+    def handle_ready(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+
+    def _generate_points(self, config):
+        # rectangular
+        x_cnt, y_cnt = bed_mesh.parse_pair(
+            config, ('probe_count', '3'), check=False, cast=int, minval=3)
+        min_x, min_y = bed_mesh.parse_pair(config, ('mesh_min',))
+        max_x, max_y = bed_mesh.parse_pair(config, ('mesh_max',))
+        #pps = bed_mesh.parse_pair(config, ('mesh_pps', '2'), check=False, cast=int, minval=0)
+        pps = [0, 0]
+        if max_x <= min_x or max_y <= min_y:
+            raise config.error('bed_mesh: invalid min/max points')
+
+        self.mesh_params['x_count'] = x_cnt
+        self.mesh_params['y_count'] = y_cnt
+        self.mesh_params['min_x'] = min_x
+        self.mesh_params['max_x'] = max_x
+        self.mesh_params['min_y'] = min_y
+        self.mesh_params['max_y'] = max_y
+        self.mesh_params['mesh_x_pps'] = pps[0]
+        self.mesh_params['mesh_y_pps'] = pps[1]
+
+        x_dist = (max_x - min_x) / (x_cnt - 1)
+        y_dist = (max_y - min_y) / (y_cnt - 1)
+        # floor distances down to next hundredth
+        x_dist = math.floor(x_dist * 100) / 100
+        y_dist = math.floor(y_dist * 100) / 100
+        if x_dist <= 1. or y_dist <= 1.:
+            raise config.error("bed_mesh: min/max points too close together")
+
+        # rectangular bed, only re-calc max_x
+        max_x = min_x + x_dist * (x_cnt - 1)
+        pos_y = min_y
+        points = []
+        for i in range(y_cnt):
+            for j in range(x_cnt):
+                if not i % 2:
+                    # move in positive directon
+                    pos_x = min_x + j * x_dist
+                else:
+                    # move in negative direction
+                    pos_x = max_x - j * x_dist
+                points.append((pos_x, pos_y))
+            pos_y += y_dist
+        return points
 
     cmd_QUAD_GANTRY_LEVEL_help = (
         "Conform a moving, twistable gantry to the shape of a stationary bed")
@@ -83,6 +162,10 @@ class QuadGantryLevelMyMod:
         "TEMP : manual adjustment")
     cmd_QUAD_GANTRY_ADJUST_help = (
         "TEMP : default adjustment")
+    cmd_cmd_QUAD_BED_MESH_ADJUST_help = (
+        "cmd_cmd_QUAD_BED_MESH_ADJUST_help")
+    cmd_QUAD_BED_MESH_CLEAR_help = (
+        "cmd_QUAD_BED_MESH_CLEAR_help")
 
     def cmd_QUAD_GANTRY_LEVEL(self, params):
         self.retry_helper.start(params)
@@ -131,24 +214,71 @@ class QuadGantryLevelMyMod:
                     "is greater than max_adjust %0.6f" % (self.max_adjust))
                 return
             self.default_adjust = z_adjusts
-            self.save_default_adjust()
+            self.save_custom_data()
         except:
             self.gcode.respond_info(traceback.format_exc())
-    
-    
-    default_adjust_file_name = '/home/pi/quad_gantry_default_adjustment.json'
-    def load_default_adjust(self):
-        self.default_adjust = [Decimal(0),Decimal(0),Decimal(0),Decimal(0)]
-        if os.path.exists(self.default_adjust_file_name):
-            with open(self.default_adjust_file_name, 'r') as f:
-                for idx, v in enumerate(f.readlines()):
-                    self.default_adjust[idx] = Decimal(v)   
- 
-    def save_default_adjust(self):
-        with open(self.default_adjust_file_name, 'w') as f:
-            for val in self.default_adjust:
-                f.write(str(val))
-                f.write('\n')
+
+    def cmd_QUAD_BED_MESH_ADJUST(self, params):
+        try:
+            # mesh_pps 는 0으로 강제했기에 x와 y값만 곱함
+            x_cnt = self.mesh_params['x_count']
+            y_cnt = self.mesh_params['y_count']
+            total_point_count = x_cnt * y_cnt
+            z_matrix = []
+
+            self.gcode.respond_info("QUAD_BED_MESH_ADJUST----------------")
+            self.gcode.respond_info(json.dumps(params))
+
+            row = []
+            for idx in range(total_point_count):
+                # 좌측 하단부터 오른쪽으로 순서대로.
+                # 원래 BedMesh에서는 ㄹ처럼 지그재그로 프로빙을한다.
+                # 나중에 finalize 해서 받은 Z 값에 대해서는 X가 작은데서 큰데로 올라가는 순서로
+                # 좌측하단부터 위로 올라가는 순서로 파라미터를 넘긴다.
+                # 나는 좌측 상단부터 내려가는것을 원하기때문에 뒤집어준다.
+                k = 'Z' + str(idx)
+                val = 0
+                if k in params:
+                    val = float(params[k])
+                row.append(val)
+
+                if len(row) == x_cnt:
+                    z_matrix.index(0, row)
+                    row = []
+            self.z_mesh_matrix = z_matrix
+            self.apply_mesh()
+            self.save_custom_data()
+        except:
+            self.gcode.respond_info(traceback.format_exc())
+
+    def apply_mesh(self):
+        mesh = bed_mesh.ZMesh(self.mesh_params)
+        try:
+            mesh.build_mesh(self.z_mesh_matrix)
+        except bed_mesh.BedMeshError as e:
+            raise self.gcode.error(e.message)
+        self.set_mesh(mesh)
+
+    def cmd_QUAD_BED_MESH_CLEAR(self, params):
+        self.set_mesh(None)
+
+    custom_data_file_name = '/home/pi/quad_gantry_custom_data.json'
+
+    def load_custom_data(self):
+        if os.path.exists(self.custom_data_file_name):
+            with open(self.custom_data_file_name, 'r') as f:
+                json_data = f.read()
+            scheme = json.loads(json_data)
+            self.default_adjust = [Decimal(v) for v in scheme['default_adjust']]
+            self.z_mesh_matrix = scheme['z_mesh_matrix']
+
+    def save_custom_data(self):
+        scheme = dict()
+        scheme['default_adjust'] = [str(v) for v in self.default_adjust]
+        scheme['z_mesh_matrix'] = self.z_mesh_matrix
+        json_string = json.dumps(scheme, indent=4, sort_keys=False)
+        with open(self.custom_data_file_name, 'w') as f:
+            f.write(json_string)
 
     def probe_finalize(self, offsets, positions):
         # 빌드플레이트와 gantry는 평행해야하기때문에 굳이 뒤집어서 계산하지말자. 심플하게.
@@ -233,10 +363,9 @@ class QuadGantryLevelMyMod:
         return self.retry_helper.check_retry([p[2] for p in probe_points])
 
     def adjust_z_steppers(self, adjust_heights):
-        tool_head = self.printer.lookup_object('toolhead')
-        kin = tool_head.get_kinematics()
+        kin = self.tool_head.get_kinematics()
         z_steppers = kin.get_steppers('Z')
-        current_position = tool_head.get_position()
+        current_position = self.tool_head.get_position()
         # Report on movements
         step_strs = ["%s = %.6f" % (s.get_name(), float(a))
                      for s, a in zip(z_steppers, adjust_heights)]
@@ -249,95 +378,120 @@ class QuadGantryLevelMyMod:
 
         try:
             for v in positions:
-                tool_head.flush_step_generation()
+                self.tool_head.flush_step_generation()
                 for s in z_steppers:
                     s.set_trapq(None)
                 stepper_offset, stepper = v
-                stepper.set_trapq(tool_head.get_trapq())
+                stepper.set_trapq(self.tool_head.get_trapq())
                 new_pos = current_position
                 new_pos[2] = new_pos[2] + stepper_offset
-                tool_head.move(new_pos, speed)
-                tool_head.set_position(current_position)
+                self.tool_head.move(new_pos, speed)
+                self.tool_head.set_position(current_position)
         except Exception as e:
             self.gcode.respond_info(str(e))
             self.gcode.respond_info(traceback.format_exc())
             logging.exception("ZAdjustHelper adjust_steppers")
             raise
         finally:
-            tool_head.flush_step_generation()
+            self.tool_head.flush_step_generation()
             for s in z_steppers:
-                s.set_trapq(tool_head.get_trapq())
-            tool_head.set_position(current_position)
+                s.set_trapq(self.tool_head.get_trapq())
+            self.tool_head.set_position(current_position)
             self.gcode.reset_last_position()
-'''
-    def probe_finalize(self, offsets, positions):
-        # Mirror our perspective so the adjustments make sense
-        # from the perspective of the gantry
-        z_positions = [self.horizontal_move_z - p[2] for p in positions]
-        points_message = "Gantry-relative probe points:\n%s\n" % (
-            " ".join(["%s: %.6f" % (z_id, z_positions[z_id])
-                for z_id in range(len(z_positions))]))
-        self.gcode.respond_info(points_message)
-        # x의 위치와 그 위치에서의 z값, z값은 위에서 말한것처럼
-        # gantry가 lift 되어서 내려올때까지의 거리 그공간을 뒤집어서 위로 올라간다생각하면됨.
-        p1 = [positions[0][0] + offsets[0],z_positions[0]]
-        p2 = [positions[1][0] + offsets[0],z_positions[1]]
-        p3 = [positions[2][0] + offsets[0],z_positions[2]]
-        p4 = [positions[3][0] + offsets[0],z_positions[3]]
-        # 좌우로 라인을 그어서 직선의 방정식을 만들어 mx+b=y의 모양을 만든다. m값과 b값을 구함.
-        f1 = self.linefit(p1,p4)
-        f2 = self.linefit(p2,p3)
-        logging.info("quad_gantry_level f1: %s, f2: %s" % (f1,f2))
-        # 이제 세로의 기울기 구하기 앞에가 1 뒤에가 2.
-        # y값과 그 위치에서의 z값
-        a1 = [positions[0][1] + offsets[1],
-              self.plot(f1,self.gantry_corners[0][0])]
-        a2 = [positions[1][1] + offsets[1],
-              self.plot(f2,self.gantry_corners[0][0])]
-        b1 = [positions[0][1] + offsets[1],
-              self.plot(f1,self.gantry_corners[1][0])]
-        b2 = [positions[1][1] + offsets[1],
-              self.plot(f2,self.gantry_corners[1][0])]
-        af = self.linefit(a1,a2)
-        bf = self.linefit(b1,b2)
-        logging.info("quad_gantry_level af: %s, bf: %s" % (af,bf))
-        z_height = [0,0,0,0]
-        z_height[0] = self.plot(af,self.gantry_corners[0][1])
-        z_height[1] = self.plot(af,self.gantry_corners[1][1])
-        z_height[2] = self.plot(bf,self.gantry_corners[1][1])
-        z_height[3] = self.plot(bf,self.gantry_corners[0][1])
 
-        ainfo = zip(["z","z1","z2","z3"], z_height[0:4])
-        apos = " ".join(["%s: %06f" % (x) for x in ainfo])
-        self.gcode.respond_info("Actuator Positions:\n" + apos)
+    FADE_DISABLE = 0x7FFFFFFF
 
-        z_ave = sum(z_height) / len(z_height)
-        self.gcode.respond_info("Average: %0.6f" % z_ave)
-        z_adjust = []
-        for z in z_height:
-            z_adjust.append(z_ave - z)
+    def set_mesh(self, mesh):
+        if mesh is not None and self.fade_end != self.FADE_DISABLE:
+            self.log_fade_complete = True
+            if self.base_fade_target is None:
+                self.fade_target = mesh.avg_z
+            else:
+                self.fade_target = self.base_fade_target
+                min_z, max_z = mesh.get_z_range()
+                if (not min_z <= self.fade_target <= max_z and
+                        self.fade_target != 0.):
+                    # fade target is non-zero, out of mesh range
+                    err_target = self.fade_target
+                    self.z_mesh = None
+                    self.fade_target = 0.
+                    raise self.gcode.error(
+                        "bed_mesh: ERROR, fade_target lies outside of mesh z "
+                        "range\nmin: %.4f, max: %.4f, fade_target: %.4f"
+                        % (min_z, max_z, err_target))
+            if self.fade_target:
+                mesh.offset_mesh(self.fade_target)
+            min_z, max_z = mesh.get_z_range()
+            if self.fade_dist <= max(abs(min_z), abs(max_z)):
+                self.z_mesh = None
+                self.fade_target = 0.
+                raise self.gcode.error(
+                    "bed_mesh:  Mesh extends outside of the fade range, "
+                    "please see the fade_start and fade_end options in"
+                    "example-extras.cfg. fade distance: %.2f mesh min: %.4f"
+                    "mesh max: %.4f" % (self.fade_dist, min_z, max_z))
+        else:
+            self.fade_target = 0.
+        self.z_mesh = mesh
+        self.splitter.initialize(mesh)
+        # cache the current position before a transform takes place
+        self.gcode.reset_last_position()
 
-        adjust_max = max(z_adjust)
-        if adjust_max > self.max_adjust:
-            self.gcode.respond_error(
-                "Aborting quad_gantry_level " +
-                "required adjustment %0.6f " % ( adjust_max ) +
-                "is greater than max_adjust %0.6f" % (self.max_adjust))
-            return
+    def get_z_factor(self, z_pos):
+        if z_pos >= self.fade_end:
+            return 0.
+        elif z_pos >= self.fade_start:
+            return (self.fade_end - z_pos) / self.fade_dist
+        else:
+            return 1.
 
-        speed = self.probe_helper.get_lift_speed()
-        self.z_helper.adjust_steppers(z_adjust, speed)
-        return self.retry_helper.check_retry(z_positions)
-    def linefit(self,p1,p2):
-        if p1[1] == p2[1]:
-            # Straight line
-            return 0,p1[1]
-        m = (p2[1] - p1[1])/(p2[0] - p1[0])
-        b = p1[1] - m * p1[0]
-        return m,b
-    def plot(self,f,x):
-        return f[0]*x + f[1]
-'''
+    def get_position(self):
+        # Return last, non-transformed position
+        if self.z_mesh is None:
+            # No mesh calibrated, so send toolhead position
+            self.last_position[:] = self.toolhead.get_position()
+            self.last_position[2] -= self.fade_target
+        else:
+            # return current position minus the current z-adjustment
+            x, y, z, e = self.toolhead.get_position()
+            z_adj = self.z_mesh.calc_z(x, y)
+            factor = 1.
+            max_adj = z_adj + self.fade_target
+            if min(z, (z - max_adj)) >= self.fade_end:
+                # Fade out is complete, no factor
+                factor = 0.
+            elif max(z, (z - max_adj)) >= self.fade_start:
+                # Likely in the process of fading out adjustment.
+                # Because we don't yet know the gcode z position, use
+                # algebra to calculate the factor from the toolhead pos
+                factor = ((self.fade_end + self.fade_target - z) /
+                          (self.fade_dist - z_adj))
+                factor = bed_mesh.constrain(factor, 0., 1.)
+            final_z_adj = factor * z_adj + self.fade_target
+            self.last_position[:] = [x, y, z - final_z_adj, e]
+        return list(self.last_position)
+
+    def move(self, newpos, speed):
+        factor = self.get_z_factor(newpos[2])
+        if self.z_mesh is None or not factor:
+            # No mesh calibrated, or mesh leveling phased out.
+            x, y, z, e = newpos
+            if self.log_fade_complete:
+                self.log_fade_complete = False
+                logging.info(
+                    "bed_mesh fade complete: Current Z: %.4f fade_target: %.4f "
+                    % (z, self.fade_target))
+            self.toolhead.move([x, y, z + self.fade_target, e], speed)
+        else:
+            self.splitter.build_move(self.last_position, newpos, factor)
+            while not self.splitter.traverse_complete:
+                split_move = self.splitter.split()
+                if split_move:
+                    self.toolhead.move(split_move, speed)
+                else:
+                    raise self.gcode.error(
+                        "Mesh Leveling: Error splitting move ")
+        self.last_position[:] = newpos
 
 
 def load_config(config):
