@@ -46,6 +46,8 @@ def get_estimated_z_value(normal_v, base_point_v, xy_for_estimate):
 class QuadGantryLevelMyMod:
     def __init__(self, config):
         self.printer = config.get_printer()
+        self.printer.register_event_handler("klippy:ready",
+                                            self.handle_ready)
         self.retry_helper = z_tilt.RetryHelper(config,
             "Possibly Z motor numbering is wrong")
         self.max_adjust = config.getfloat("max_adjust", 4, above=0)
@@ -56,6 +58,7 @@ class QuadGantryLevelMyMod:
                 "Need exactly 4 probe points for quad_gantry_level")
         self.default_adjust = [Decimal(0), Decimal(0), Decimal(0), Decimal(0)]
         self.z_mesh_matrix = None
+        self.last_position = [0., 0., 0., 0.]
         self.load_custom_data()
         gantry_corners = config.get('gantry_corners').split('\n')
         try:
@@ -87,7 +90,7 @@ class QuadGantryLevelMyMod:
             'QUAD_BED_MESH_CLEAR', self.cmd_QUAD_BED_MESH_CLEAR,
             desc=self.cmd_QUAD_BED_MESH_CLEAR_help)
 
-        self.toolhead = None
+        self.tool_head = None
         self.z_mesh = None
         self.use_additional_z_mesh = config.getboolean("use_additional_z_mesh", False)
         if self.use_additional_z_mesh:
@@ -107,10 +110,11 @@ class QuadGantryLevelMyMod:
             self.fade_target = 0.
             self.splitter = bed_mesh.MoveSplitter(config, self.gcode)
             self.gcode.set_move_transform(self)
-            self.apply_mesh()
 
     def handle_ready(self):
-        self.toolhead = self.printer.lookup_object('toolhead')
+        self.tool_head = self.printer.lookup_object('toolhead')
+        if self.use_additional_z_mesh:
+            self.apply_mesh()
 
     def _generate_points(self, config):
         # rectangular
@@ -243,7 +247,7 @@ class QuadGantryLevelMyMod:
                 row.append(val)
 
                 if len(row) == x_cnt:
-                    z_matrix.index(0, row)
+                    z_matrix.insert(0, row)
                     row = []
             self.z_mesh_matrix = z_matrix
             self.apply_mesh()
@@ -252,12 +256,13 @@ class QuadGantryLevelMyMod:
             self.gcode.respond_info(traceback.format_exc())
 
     def apply_mesh(self):
-        mesh = bed_mesh.ZMesh(self.mesh_params)
-        try:
-            mesh.build_mesh(self.z_mesh_matrix)
-        except bed_mesh.BedMeshError as e:
-            raise self.gcode.error(e.message)
-        self.set_mesh(mesh)
+        if self.z_mesh_matrix is not None:
+            mesh = bed_mesh.ZMesh(self.mesh_params)
+            try:
+                mesh.build_mesh(self.z_mesh_matrix)
+            except bed_mesh.BedMeshError as e:
+                raise self.gcode.error(e.message)
+            self.set_mesh(mesh)
 
     def cmd_QUAD_BED_MESH_CLEAR(self, params):
         self.set_mesh(None)
@@ -351,20 +356,25 @@ class QuadGantryLevelMyMod:
                       for z_id in range(len(z_adjust))]))
         self.gcode.respond_info(points_message)
 
-        adjust_max = max([abs(v) for v in z_adjust])
-        if adjust_max > self.max_adjust:
-            self.gcode.respond_error(
-                "Aborting quad_gantry_level " +
-                "required adjustment %0.6f " % (adjust_max) +
-                "is greater than max_adjust %0.6f" % (self.max_adjust))
-            return
+        try:
+            adjust_max = max([abs(v) for v in z_adjust])
+            if adjust_max > self.max_adjust:
+                self.gcode.respond_error(
+                    "Aborting quad_gantry_level " +
+                    "required adjustment %0.6f " % (adjust_max) +
+                    "is greater than max_adjust %0.6f" % (self.max_adjust))
+                return
 
-        self.adjust_z_steppers(z_adjust)
-        return self.retry_helper.check_retry([p[2] for p in probe_points])
+            self.adjust_z_steppers(z_adjust)
+            return self.retry_helper.check_retry([p[2] for p in probe_points])
+        except Exception as e:
+            self.gcode.respond_info(str(e))
+            self.gcode.respond_info(traceback.format_exc())
+            raise e
 
     def adjust_z_steppers(self, adjust_heights):
         kin = self.tool_head.get_kinematics()
-        z_steppers = kin.get_steppers('Z')
+        z_steppers = [s for s in kin.get_steppers() if s.is_active_axis('z')]
         current_position = self.tool_head.get_position()
         # Report on movements
         step_strs = ["%s = %.6f" % (s.get_name(), float(a))
@@ -449,11 +459,11 @@ class QuadGantryLevelMyMod:
         # Return last, non-transformed position
         if self.z_mesh is None:
             # No mesh calibrated, so send toolhead position
-            self.last_position[:] = self.toolhead.get_position()
+            self.last_position[:] = self.tool_head.get_position()
             self.last_position[2] -= self.fade_target
         else:
             # return current position minus the current z-adjustment
-            x, y, z, e = self.toolhead.get_position()
+            x, y, z, e = self.tool_head.get_position()
             z_adj = self.z_mesh.calc_z(x, y)
             factor = 1.
             max_adj = z_adj + self.fade_target
@@ -481,13 +491,13 @@ class QuadGantryLevelMyMod:
                 logging.info(
                     "bed_mesh fade complete: Current Z: %.4f fade_target: %.4f "
                     % (z, self.fade_target))
-            self.toolhead.move([x, y, z + self.fade_target, e], speed)
+            self.tool_head.move([x, y, z + self.fade_target, e], speed)
         else:
             self.splitter.build_move(self.last_position, newpos, factor)
             while not self.splitter.traverse_complete:
                 split_move = self.splitter.split()
                 if split_move:
-                    self.toolhead.move(split_move, speed)
+                    self.tool_head.move(split_move, speed)
                 else:
                     raise self.gcode.error(
                         "Mesh Leveling: Error splitting move ")
