@@ -265,6 +265,8 @@ class QuadGantryLevelMyMod:
 
     def cmd_QUAD_BED_MESH_CLEAR(self, params):
         self.set_mesh(None)
+        self.z_mesh_matrix = None
+        self.save_custom_data()
 
     custom_data_file_name = '/home/pi/quad_gantry_custom_data.json'
 
