@@ -83,17 +83,18 @@ class QuadGantryLevelMyMod:
         self.gcode.register_command(
             'QUAD_GANTRY_ADJUST', self.cmd_QUAD_GANTRY_ADJUST,
             desc=self.cmd_QUAD_GANTRY_ADJUST_help)
-        self.gcode.register_command(
-            'QUAD_BED_MESH_ADJUST', self.cmd_QUAD_BED_MESH_ADJUST,
-            desc=self.cmd_cmd_QUAD_BED_MESH_ADJUST_help)
-        self.gcode.register_command(
-            'QUAD_BED_MESH_CLEAR', self.cmd_QUAD_BED_MESH_CLEAR,
-            desc=self.cmd_QUAD_BED_MESH_CLEAR_help)
 
         self.tool_head = None
         self.z_mesh = None
         self.use_additional_z_mesh = config.getboolean("use_additional_z_mesh", False)
         if self.use_additional_z_mesh:
+            self.gcode.register_command(
+                'QUAD_BED_MESH_ADJUST', self.cmd_QUAD_BED_MESH_ADJUST,
+                desc=self.cmd_cmd_QUAD_BED_MESH_ADJUST_help)
+            self.gcode.register_command(
+                'QUAD_BED_MESH_CLEAR', self.cmd_QUAD_BED_MESH_CLEAR,
+                desc=self.cmd_QUAD_BED_MESH_CLEAR_help)
+
             self.mesh_params = collections.OrderedDict()
             self.mesh_params['algo'] = 'direct'
             self.points = self._generate_points(config)
