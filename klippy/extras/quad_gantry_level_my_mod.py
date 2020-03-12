@@ -95,9 +95,7 @@ class QuadGantryLevelMyMod:
         self.use_additional_z_mesh = config.getboolean("use_additional_z_mesh", False)
         if self.use_additional_z_mesh:
             self.mesh_params = collections.OrderedDict()
-            self.mesh_params['algo'] = 'bicubic'
-            self.mesh_params['tension'] = config.getfloat(
-                'bicubic_tension', .2, minval=0., maxval=2.)
+            self.mesh_params['algo'] = 'direct'
             self.points = self._generate_points(config)
             self.fade_start = config.getfloat('fade_start', 1.)
             self.fade_end = config.getfloat('fade_end', 0.)
