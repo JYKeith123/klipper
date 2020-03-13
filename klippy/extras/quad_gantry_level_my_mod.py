@@ -94,10 +94,47 @@ class QuadGantryLevelMyMod:
             self.gcode.register_command(
                 'QUAD_BED_MESH_CLEAR', self.cmd_QUAD_BED_MESH_CLEAR,
                 desc=self.cmd_QUAD_BED_MESH_CLEAR_help)
+            self.gcode.register_command(
+                'QUAD_PRINT_BED_MESH', self.cmd_QUAD_PRINT_BED_MESH,
+                desc=self.cmd_QUAD_PRINT_BED_MESH_help)
 
             self.mesh_params = collections.OrderedDict()
             self.mesh_params['algo'] = 'direct'
-            self.points = self._generate_points(config)
+
+            size = bed_mesh.parse_pair(
+                config, ('probe_count', '3'), check=False, cast=int, minval=3)
+            # rectangular
+            min = bed_mesh.parse_pair(config, ('mesh_min',))
+            max = bed_mesh.parse_pair(config, ('mesh_max',))            
+            # pps = bed_mesh.parse_pair(config, ('mesh_pps', '2'), check=False, cast=int, minval=0)
+
+            x_cnt, y_cnt = size
+            min_x, min_y = min
+            max_x, max_y = max
+            pps = [0, 0]
+
+            if self.z_mesh_matrix is not None:
+                row_count = len(self.z_mesh_matrix)
+                column_count = len(self.z_mesh_matrix[0])
+                if row_count * column_count != x_cnt * y_cnt:
+                    self.z_mesh_matrix = None
+
+            if max_x <= min_x or max_y <= min_y:
+                raise config.error('bed_mesh: invalid min/max points')
+
+            self.mesh_params['x_count'] = x_cnt
+            self.mesh_params['y_count'] = y_cnt
+            self.mesh_params['min_x'] = min_x
+            self.mesh_params['max_x'] = max_x
+            self.mesh_params['min_y'] = min_y
+            self.mesh_params['max_y'] = max_y
+            self.mesh_params['mesh_x_pps'] = pps[0]
+            self.mesh_params['mesh_y_pps'] = pps[1]
+
+            try:
+                self.points = self._generate_points(size, min, max)
+            except Exception as e:
+                raise config.error(str(e))
             self.fade_start = config.getfloat('fade_start', 1.)
             self.fade_end = config.getfloat('fade_end', 0.)
             self.fade_dist = self.fade_end - self.fade_start
@@ -115,25 +152,10 @@ class QuadGantryLevelMyMod:
         if self.use_additional_z_mesh:
             self.apply_mesh()
 
-    def _generate_points(self, config):
-        # rectangular
-        x_cnt, y_cnt = bed_mesh.parse_pair(
-            config, ('probe_count', '3'), check=False, cast=int, minval=3)
-        min_x, min_y = bed_mesh.parse_pair(config, ('mesh_min',))
-        max_x, max_y = bed_mesh.parse_pair(config, ('mesh_max',))
-        #pps = bed_mesh.parse_pair(config, ('mesh_pps', '2'), check=False, cast=int, minval=0)
-        pps = [0, 0]
-        if max_x <= min_x or max_y <= min_y:
-            raise config.error('bed_mesh: invalid min/max points')
-
-        self.mesh_params['x_count'] = x_cnt
-        self.mesh_params['y_count'] = y_cnt
-        self.mesh_params['min_x'] = min_x
-        self.mesh_params['max_x'] = max_x
-        self.mesh_params['min_y'] = min_y
-        self.mesh_params['max_y'] = max_y
-        self.mesh_params['mesh_x_pps'] = pps[0]
-        self.mesh_params['mesh_y_pps'] = pps[1]
+    def _generate_points(self, size, min, max):
+        x_cnt, y_cnt = size
+        min_x, min_y = min
+        max_x, max_y = max
 
         x_dist = (max_x - min_x) / (x_cnt - 1)
         y_dist = (max_y - min_y) / (y_cnt - 1)
@@ -141,7 +163,7 @@ class QuadGantryLevelMyMod:
         x_dist = math.floor(x_dist * 100) / 100
         y_dist = math.floor(y_dist * 100) / 100
         if x_dist <= 1. or y_dist <= 1.:
-            raise config.error("bed_mesh: min/max points too close together")
+            raise Exception("bed_mesh: min/max points too close together")
 
         # rectangular bed, only re-calc max_x
         max_x = min_x + x_dist * (x_cnt - 1)
@@ -169,6 +191,8 @@ class QuadGantryLevelMyMod:
         "cmd_cmd_QUAD_BED_MESH_ADJUST_help")
     cmd_QUAD_BED_MESH_CLEAR_help = (
         "cmd_QUAD_BED_MESH_CLEAR_help")
+    cmd_QUAD_PRINT_BED_MESH_help = (
+        "cmd_QUAD_PRINT_BED_MESH_help")
 
     def cmd_QUAD_GANTRY_LEVEL(self, params):
         self.retry_helper.start(params)
@@ -267,6 +291,58 @@ class QuadGantryLevelMyMod:
         self.set_mesh(None)
         self.z_mesh_matrix = None
         self.save_custom_data()
+
+    def cmd_QUAD_PRINT_BED_MESH(self, params):
+        if self.z_mesh_matrix is None:
+            return
+
+        try:
+            self.gcode.respond_info("cmd_QUAD_PRINT_BED_MESH----------------")
+            self.gcode.respond_info(json.dumps(params))
+
+            if 'SIZE' in params:
+                val = params['SIZE'].strip().split(',', 1)
+                pair = tuple(int(p.strip()) for p in val)
+                if len(pair) != 2:
+                    raise Exception("wrong parameter")
+                elif len(pair) == 1:
+                    pair = (pair[0], pair[0])
+            else:
+                pair = (self.mesh_params['x_count'], self.mesh_params['y_count'])
+
+            generated_points = self._generate_points(
+                pair,
+                (self.mesh_params['min_x'], self.mesh_params['min_y']),
+                (self.mesh_params['max_x'], self.mesh_params['max_y']))
+
+            xy_position = []
+            row = []
+            prev_pos = generated_points[0]
+            for pos in generated_points:
+                if not bed_mesh.isclose(pos[1], prev_pos[1], abs_tol=.1):
+                    # y has changed, append row and start new
+                    xy_position.insert(0, row)
+                    row = []
+                z_height = self.z_mesh.calc_z(pos[0], pos[1])
+                if pos[0] > prev_pos[0]:
+                    # probed in the positive direction
+                    row.append(z_height)
+                else:
+                    # probed in the negative direction
+                    row.insert(0, z_height)
+                prev_pos = pos
+            # append last row
+            xy_position.insert(0, row)
+
+            output_string = ''
+            for r in xy_position:
+                output_string += '\t'.join(['%6f' % z_h for z_h in r])
+                output_string += '\n'
+            self.gcode.respond_info(output_string)
+        except Exception as e:
+            self.gcode.respond_info(str(e))
+            self.gcode.respond_info(traceback.format_exc())
+
 
     custom_data_file_name = '/home/pi/quad_gantry_custom_data.json'
 
