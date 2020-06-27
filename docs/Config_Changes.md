@@ -6,6 +6,43 @@ All dates in this document are approximate.
 
 # Changes
 
+20200608: The LCD display support has changed the name of some
+internal "glyphs".  If a custom display layout was implemented it may
+be necessary to update to the latest glyph names (see
+klippy/extras/display/display.cfg for a list of available glyphs).
+
+20200606: The pin names on linux mcu have changed. Pins now have names
+of the form `gpiochip<chipid>/gpio<gpio>`.  For gpiochip0 you can also
+use a short `gpio<gpio>`.  For example, what was previously referred
+to as `P20` now becomes `gpio20` or `gpiochip0/gpio20`.
+
+20200603: The default 16x4 LCD layout will no longer show the
+estimated time remaining in a print.  (Only the elapsed time will be
+shown.)  If the old behavior is desired one can customize the menu
+display with that information (see the description of display_data in
+config/example-extras.cfg for details).
+
+20200531: The default USB vendor/product id is now 0x1d50/0x614e.
+These new ids are reserved for Klipper (thanks to the openmoko
+project). This change should not require any config changes, but the
+new ids may appear in system logs.
+
+20200524: The default value for the tmc5160 pwm_freq field is now zero
+(instead of one).
+
+20200425: The gcode_macro command template variable `printer.heater`
+was renamed to `printer.heaters`.
+
+20200313: The default lcd layout for multi-extruder printers with a
+16x4 screen has changed.  The single extruder screen layout is now the
+default and it will show the currently active extruder.  To use the
+previous display layout set "display_group: _multiextruder_16x4" in
+the [display] section of the printer.cfg file.
+
+20200308: The default `__test` menu item was removed. If the config
+file has a custom menu then be sure to remove all references to this
+`__test` menu item.
+
 20200308: The menu "deck" and "card" options were removed. To
 customize the layout of an lcd screen use the new display_data config
 sections (see config/example-extras.cfg for the details).

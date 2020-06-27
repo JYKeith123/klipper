@@ -337,14 +337,14 @@ class RetryAsyncCommand:
 # Wrapper around query commands
 class CommandQueryWrapper:
     def __init__(self, serial, msgformat, respformat, oid=None,
-                 cmd_queue=None, async=False):
+                 cmd_queue=None, is_async=False):
         self._serial = serial
         self._cmd = serial.get_msgparser().lookup_command(msgformat)
         serial.get_msgparser().lookup_command(respformat)
         self._response = respformat.split()[0]
         self._oid = oid
         self._xmit_helper = serialhdl.SerialRetryCommand
-        if async:
+        if is_async:
             self._xmit_helper = RetryAsyncCommand
         if cmd_queue is None:
             cmd_queue = serial.get_default_command_queue()
@@ -386,16 +386,22 @@ class MCU:
                                              self._disconnect)
         # Serial port
         self._serialport = config.get('serial', '/dev/ttyS0')
+        serial_rts = True
+        if config.get('restart_method', None) == "cheetah":
+            # Special case: Cheetah boards require RTS to be deasserted, else
+            # a reset will trigger the built-in bootloader.
+            serial_rts = False
         baud = 0
         if not (self._serialport.startswith("/dev/rpmsg_")
                 or self._serialport.startswith("/tmp/klipper_host_")):
             baud = config.getint('baud', 250000, minval=2400)
         self._serial = serialhdl.SerialReader(
-            self._reactor, self._serialport, baud)
+            self._reactor, self._serialport, baud, serial_rts)
         # Restarts
         self._restart_method = 'command'
         if baud:
-            rmethods = {m: m for m in [None, 'arduino', 'command', 'rpi_usb']}
+            rmethods = {m: m for m in [None, 'arduino', 'cheetah', 'command',
+                                       'rpi_usb']}
             self._restart_method = config.getchoice(
                 'restart_method', rmethods, None)
         self._reset_cmd = self._config_reset_cmd = None
@@ -444,6 +450,10 @@ class MCU:
         if params['#name'] == 'is_shutdown':
             prefix = "Previous MCU '%s' shutdown: " % (self._name,)
         self._printer.invoke_async_shutdown(prefix + msg + error_help(msg))
+    def _handle_starting(self, params):
+        if not self._is_shutdown:
+            self._printer.invoke_async_shutdown("MCU '%s' spontaneous restart"
+                                                % (self._name,))
     # Connection phase
     def _check_restart(self, reason):
         start_reason = self._printer.get_start_args().get("start_reason")
@@ -503,15 +513,16 @@ class MCU:
         # Calculate config CRC
         config_crc = zlib.crc32('\n'.join(self._config_cmds)) & 0xffffffff
         self.add_config_cmd("finalize_config crc=%d" % (config_crc,))
+        if prev_crc is not None and config_crc != prev_crc:
+            self._check_restart("CRC mismatch")
+            raise error("MCU '%s' CRC does not match config" % (self._name,))
         # Transmit config messages (if needed)
+        self.register_response(self._handle_starting, 'starting')
         if prev_crc is None:
             logging.info("Sending MCU '%s' printer configuration...",
                          self._name)
             for c in self._config_cmds:
                 self._serial.send(c)
-        elif config_crc != prev_crc:
-            self._check_restart("CRC mismatch")
-            raise error("MCU '%s' CRC does not match config" % (self._name,))
         # Transmit init messages
         for c in self._init_cmds:
             self._serial.send(c)
@@ -639,9 +650,9 @@ class MCU:
     def lookup_command(self, msgformat, cq=None):
         return CommandWrapper(self._serial, msgformat, cq)
     def lookup_query_command(self, msgformat, respformat, oid=None,
-                             cq=None, async=False):
+                             cq=None, is_async=False):
         return CommandQueryWrapper(self._serial, msgformat, respformat, oid,
-                                   cq, async)
+                                   cq, is_async)
     def try_lookup_command(self, msgformat):
         try:
             return self.lookup_command(msgformat)
@@ -678,6 +689,10 @@ class MCU:
         logging.info("Attempting MCU '%s' reset", self._name)
         self._disconnect()
         serialhdl.arduino_reset(self._serialport, self._reactor)
+    def _restart_cheetah(self):
+        logging.info("Attempting MCU '%s' Cheetah-style reset", self._name)
+        self._disconnect()
+        serialhdl.cheetah_reset(self._serialport, self._reactor)
     def _restart_via_command(self):
         if ((self._reset_cmd is None and self._config_reset_cmd is None)
             or not self._clocksync.is_active()):
@@ -708,6 +723,8 @@ class MCU:
             self._restart_rpi_usb()
         elif self._restart_method == 'command':
             self._restart_via_command()
+        elif self._restart_method == 'cheetah':
+            self._restart_cheetah()
         else:
             self._restart_arduino()
     # Misc external commands

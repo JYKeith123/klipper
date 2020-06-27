@@ -21,7 +21,8 @@ Frequently asked questions
 18. [How do I convert a Marlin pin number to a Klipper pin name?](#how-do-i-convert-a-marlin-pin-number-to-a-klipper-pin-name)
 19. [How do I cancel an M109/M190 "wait for temperature" request?](#how-do-i-cancel-an-m109m190-wait-for-temperature-request)
 20. [Can I find out whether the printer has lost steps?](#can-i-find-out-whether-the-printer-has-lost-steps)
-21. [How do I upgrade to the latest software?](#how-do-i-upgrade-to-the-latest-software)
+21. [Why does Klipper report errors? I lost my print!](#why-does-klipper-report-errors-i-lost-my-print)
+22. [How do I upgrade to the latest software?](#how-do-i-upgrade-to-the-latest-software)
 
 ### How can I donate to the project?
 
@@ -256,46 +257,11 @@ configured in Marlin.
 
 ### My TMC motor driver turns off in the middle of a print
 
-Short answer: Do not use the TMC2208 driver in "standalone mode" with
-Klipper! Do not use the TMC2224 driver in "stealthchop standalone
-mode" with Klipper!
-
-Long answer: Klipper implements very precise timing.
-
-![tmc2208](img/tmc2208.svg.png)
-
-In the above picture, if Klipper is requested to move along the red
-line and if each black line represents the nominal location to step a
-stepper, then in the middle of that movement Klipper will arrange to
-take a step, change the step direction, and then step back. Klipper
-can perform this step, direction change, and step back in a very small
-amount of time.
-
-It is our current understanding that the TMC2208 and TMC2224 will
-react poorly to this when they are in "stealthchop" mode. (It is not
-believed any other TMC drivers are impacted.) It is believed that when
-the driver sees the two step requests in a small time frame that it
-dramatically increases current in anticipation of high acceleration.
-That high current can trip the driver's internal "over current"
-detection which causes the driver to disable itself.
-
-This pattern of steps can occur on all stepper motors and on all
-robot kinematics.
-
-The TMC2208 and TMC2224 do work well with Klipper when run-time
-configuration mode is used (that is, when a wire is routed from the
-micro-controller to the PDN-UART pin and the printer config file has a
-corresponding [tmc2208] config section). When using run-time
-configuration, either configure the drivers to use "spreadcycle mode"
-or configure them to use "stealthchop mode" with a reasonable
-"stealthchop threshold". If one wishes to exclusively use
-"stealthchop" mode with run-time UART configuration then make sure the
-stealthchop_threshold is no more than about 10% greater than the
-maximum velocity of the given axis. It is speculated that with a
-reasonable stealthchop threshold, then if Klipper sends a "step,
-direction change, step back" sequence, the driver will briefly
-transition from stealthchop mode, to spreadcycle mode, and back to
-stealthchop mode, which should be harmless.
+If using the TMC2208 (or TMC2224) driver in "standalone mode" then
+make sure to use the
+[latest version of Klipper](#how-do-i-upgrade-to-the-latest-software). A
+workaround for a TMC2208 "stealthchop" driver problem was added to
+Klipper in mid-March of 2020.
 
 ### I keep getting random "Lost communication with MCU" errors
 
@@ -448,6 +414,36 @@ likely the result of endstop inaccuracies. A stepper motor itself can
 only lose steps in increments of 4 full steps. (So, if one is using 16
 microsteps, then a lost step on the stepper would result in the "mcu:"
 step counter being off by a multiple of 64 microsteps.)
+
+### Why does Klipper report errors? I lost my print!
+
+Short answer: We want to know if our printers detect a problem so that
+the underlying issue can be fixed and we can obtain great quality
+prints. We definitely do not want our printers to silently produce low
+quality prints.
+
+Long answer: Klipper has been engineered to automatically workaround
+many transient problems. For example, it automatically detects
+communication errors and will retransmit; it schedules actions in
+advance and buffers commands at multiple layers to enable precise
+timing even with intermittent interference. However, should the
+software detect an error that it can not recover from, if it is
+commanded to take an invalid action, or if it detects it is hopelessly
+unable to perform its commanded task, then Klipper will report an
+error. In these situations there is a high risk of producing a
+low-quality print (or worse). It is hoped that alerting the user will
+empower them to fix the underlying issue and improve the overall
+quality of their prints.
+
+There are some related questions: Why doesn't Klipper pause the print
+instead? Report a warning instead? Check for errors before the print?
+Ignore errors in user typed commands? etc? Currently Klipper reads
+commands using the G-Code protocol, and unfortunately the G-Code
+command protocol is not flexible enough to make these alternatives
+practical today. There is developer interest in improving the user
+experience during abnormal events, but it is expected that will
+require notable infrastructure work (including a shift away from
+G-Code).
 
 ### How do I upgrade to the latest software?
 

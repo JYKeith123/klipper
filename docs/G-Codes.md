@@ -16,7 +16,8 @@ Klipper supports the following standard G-Code commands:
 - Set extrude factor override percentage: `M221 S<percent>`
 - Set acceleration: `M204 S<value>` OR `M204 P<value> T<value>`
   - Note: If S is not specified and both P and T are specified, then
-    the acceleration is set to the minimum of P and T.
+    the acceleration is set to the minimum of P and T. If only one of
+    P or T is specified, the command has no effect.
 - Get extruder temperature: `M105`
 - Set extruder temperature: `M104 [T<index>] [S<temperature>]`
 - Set extruder temperature and wait: `M109 [T<index>] S<temperature>`
@@ -161,6 +162,12 @@ The following standard commands are supported:
   [SMOOTH_TIME=<pressure_advance_smooth_time>]`: Set pressure advance
   parameters. If EXTRUDER is not specified, it defaults to the active
   extruder.
+- `SET_EXTRUDER_STEP_DISTANCE [EXTRUDER=<config_name>] [DISTANCE=<distance>]`:
+  Set a new value for the provided extruder's step_distance. Value is
+  not retained on Klipper reset. Use with caution, small changes can
+  result in excessive pressure between extruder and hot end. Do proper
+  calibration steps with filament before use. If 'DISTANCE' value is
+  not included command will return current step distance.
 - `SET_STEPPER_ENABLE STEPPER=<config_name> ENABLE=[0|1]`: Enable or
   disable only the given stepper. This is a diagnostic and debugging
   tool and must be used with care. Disabling an axis motor does not
@@ -195,6 +202,12 @@ The following standard commands are supported:
   adjustment will only be made every BAND millimeters of z height - in
   that case the formula used is `value = start + factor *
   ((floor(z_height / band) + .5) * band)`.
+- `SET_DISPLAY_GROUP [DISPLAY=<display>] GROUP=<group>`: Set the
+  active display group of an lcd display. This allows to define
+  multiple display data groups in the config,
+  e.g. `[display_data <group> <elementname>]` and switch between them
+  using this extended gcode command. If DISPLAY is not specified it
+  defaults to "display" (the primary display).
 - `SET_IDLE_TIMEOUT [TIMEOUT=<timeout>]`:  Allows the user to set the
   idle timeout (in seconds).
 - `RESTART`: This will cause the host software to reload its config
@@ -254,18 +267,31 @@ The following command is available when a "manual_stepper" config
 section is enabled:
 - `MANUAL_STEPPER STEPPER=config_name [ENABLE=[0|1]]
   [SET_POSITION=<pos>] [SPEED=<speed>] [ACCEL=<accel>]
-  [MOVE=<pos> [STOP_ON_ENDSTOP=[1|2|-1|-2]]`: This command will alter
-  the state of the stepper. Use the ENABLE parameter to enable/disable
-  the stepper. Use the SET_POSITION parameter to force the stepper to
-  think it is at the given position. Use the MOVE parameter to request
-  a movement to the given position. If SPEED and/or ACCEL is specified
-  then the given values will be used instead of the defaults specified
-  in the config file. If an ACCEL of zero is specified then no
-  acceleration will be performed. If STOP_ON_ENDSTOP=1 is specified
-  then the move will end early should the endstop report as triggered
-  (use STOP_ON_ENDSTOP=2 to complete the move without error even if
-  the endstop does not trigger, use -1 or -2 to stop when the endstop
-  reports not triggered).
+  [MOVE=<pos> [STOP_ON_ENDSTOP=[1|2|-1|-2]] [SYNC=0]]`: This command
+  will alter the state of the stepper. Use the ENABLE parameter to
+  enable/disable the stepper. Use the SET_POSITION parameter to force
+  the stepper to think it is at the given position. Use the MOVE
+  parameter to request a movement to the given position. If SPEED
+  and/or ACCEL is specified then the given values will be used instead
+  of the defaults specified in the config file. If an ACCEL of zero is
+  specified then no acceleration will be performed. If
+  STOP_ON_ENDSTOP=1 is specified then the move will end early should
+  the endstop report as triggered (use STOP_ON_ENDSTOP=2 to complete
+  the move without error even if the endstop does not trigger, use -1
+  or -2 to stop when the endstop reports not triggered). Normally
+  future G-Code commands will be scheduled to run after the stepper
+  move completes, however if a manual stepper move uses SYNC=0 then
+  future G-Code movement commands may run in parallel with the stepper
+  movement.
+
+## Extruder stepper Commands
+
+The following command is available when an "extruder_stepper" config
+section is enabled:
+- `SYNC_STEPPER_TO_EXTRUDER STEPPER=<extruder_stepper config_name>
+  [EXTRUDER=<extruder config_name>]`: This command will cause the given
+  STEPPER to become synchronized to the given EXTRUDER, overriding
+  the extruder defined in the "extruder_stepper" config section.
 
 ## Probe
 
@@ -292,7 +318,9 @@ enabled:
   helper script useful for calibrating the probe's z_offset. See the
   PROBE command for details on the optional probe parameters. See the
   MANUAL_PROBE command for details on the SPEED parameter and the
-  additional commands available while the tool is active.
+  additional commands available while the tool is active. Please note,
+  the PROBE_CALIBRATE command uses the speed variable to move in XY direction
+  as well as Z.
 
 ## BLTouch
 
